@@ -1,6 +1,6 @@
 package main
 
-// Imports the necessary packages.
+// This is a simple JWKS server that serves one valid and one expired RSA key.
 import (
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// RSAKey stores a key pair.(kid and expiry)
+// RSAKey represents an RSA key with its expiry and kid.
 type RSAKey struct {
 	PrivateKey *rsa.PrivateKey
 	PublicKey  *rsa.PublicKey
@@ -23,57 +23,80 @@ type RSAKey struct {
 	Kid        string
 }
 
-// Global in-memory key store.
+// In-memory key store.
 var keyStore = map[string]RSAKey{}
 
-// Initialize keys (1 valid and 1 expired)
-func initKeys() {
-	validKey := generateKey(1)   // expires within an hour
-	expiredKey := generateKey(-1) // already expired
-	keyStore[validKey.Kid] = validKey
-	keyStore[expiredKey.Kid] = expiredKey
-}
+// Generate a new RSA key with a specified expiry offset (positive for future, negative for past).
+func generateKey(expiryOffset time.Duration) RSAKey {
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
 
-// Generate an RSA key with expiryHours offset.
-func generateKey(expiryHours int) RSAKey {
-	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	// Generate a unique kid for the key.
 	kid := uuid.New().String()
+
 	return RSAKey{
 		PrivateKey: privKey,
 		PublicKey:  &privKey.PublicKey,
-		Expiry:     time.Now().Add(time.Duration(expiryHours) * time.Hour),
+		Expiry:     time.Now().Add(expiryOffset),
 		Kid:        kid,
 	}
 }
 
-// JWKS handler. (only returns unexpired keys)
+// Initialize 1 valid key and 1 expired key
+func initKeys() {
+	validKey := generateKey(1 * time.Hour)    // expires in future
+	expiredKey := generateKey(-1 * time.Hour) // already expired
+
+	keyStore[validKey.Kid] = validKey
+	keyStore[expiredKey.Kid] = expiredKey
+}
+
+// JWKS handler
 func jwksHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	keys := []map[string]string{}
 
 	for _, key := range keyStore {
-		if key.Expiry.After(time.Now()) {
+		if key.Expiry.After(time.Now()) { // only unexpired keys
 			n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
 			e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes())
+
 			keys = append(keys, map[string]string{
 				"kty": "RSA",
-				"kid": key.Kid,
 				"use": "sig",
+				"alg": "RS256",
+				"kid": key.Kid,
 				"n":   n,
 				"e":   e,
 			})
 		}
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{"keys": keys})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"keys": keys,
+	})
 }
 
-// Auth handler. (returns JWT, optionally with expired key)
+// Auth handler
 func authHandler(w http.ResponseWriter, r *http.Request) {
-	expired := r.URL.Query().Get("expired") == "true"
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if the request wants an expired token.
+	expired := r.URL.Query().Has("expired")
 	var chosenKey RSAKey
 	found := false
 
+	// Choose a key based on the expired query param.
 	for _, key := range keyStore {
 		if expired && key.Expiry.Before(time.Now()) {
 			chosenKey = key
@@ -92,11 +115,18 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set token expiration based on expired query param
+	expTime := time.Now().Add(1 * time.Hour)
+	if expired {
+		expTime = time.Now().Add(-1 * time.Hour)
+	}
+
 	token := jwt.New(jwt.SigningMethodRS256)
 	token.Header["kid"] = chosenKey.Kid
 	token.Claims = jwt.MapClaims{
 		"sub": "fakeuser",
-		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+		"exp": expTime.Unix(),
 	}
 
 	tokenString, err := token.SignedString(chosenKey.PrivateKey)
@@ -106,18 +136,17 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(tokenString))
 }
 
-// Entry point of the application.
+// Main function to start the server.
 func main() {
 	initKeys()
 
-	http.HandleFunc("/jwks", jwksHandler)
+	http.HandleFunc("/.well-known/jwks.json", jwksHandler)
 	http.HandleFunc("/auth", authHandler)
 
 	fmt.Println("JWKS server running on http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Println("Server failed:", err)
-	}
+	http.ListenAndServe(":8080", nil)
 }
