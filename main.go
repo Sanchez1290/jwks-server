@@ -141,7 +141,6 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initKeys()
 
-	// Use Render's PORT environment variable if set, otherwise default to 8080
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -153,3 +152,4 @@ func main() {
 	fmt.Printf("JWKS server running on http://localhost:%s\n", port)
 	http.ListenAndServe(":"+port, nil)
 }
+
