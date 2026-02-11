@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -33,7 +34,6 @@ func generateKey(expiryOffset time.Duration) RSAKey {
 		panic(err)
 	}
 
-	// Generate a unique kid for the key.
 	kid := uuid.New().String()
 
 	return RSAKey{
@@ -91,12 +91,10 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if the request wants an expired token.
 	expired := r.URL.Query().Has("expired")
 	var chosenKey RSAKey
 	found := false
 
-	// Choose a key based on the expired query param.
 	for _, key := range keyStore {
 		if expired && key.Expiry.Before(time.Now()) {
 			chosenKey = key
@@ -115,7 +113,6 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set token expiration based on expired query param
 	expTime := time.Now().Add(1 * time.Hour)
 	if expired {
 		expTime = time.Now().Add(-1 * time.Hour)
@@ -140,13 +137,19 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(tokenString))
 }
 
-// Main function to start the server.
+// Main function to start the server
 func main() {
 	initKeys()
+
+	// Use Render's PORT environment variable if set, otherwise default to 8080
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
 	http.HandleFunc("/.well-known/jwks.json", jwksHandler)
 	http.HandleFunc("/auth", authHandler)
 
-	fmt.Println("JWKS server running on http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	fmt.Printf("JWKS server running on http://localhost:%s\n", port)
+	http.ListenAndServe(":"+port, nil)
 }
