@@ -122,7 +122,7 @@ This repository includes:
 
 * Source code for JWKS server
 * Live Render deployment link
-* Screenshots of:
+* Screenshots of: ( I have them but github wont let me put them in for some reason but if needed can provide in another way.)
 
   * Test client calling JWKS/auth endpoints
   * Test suite output (if present) and coverage %
