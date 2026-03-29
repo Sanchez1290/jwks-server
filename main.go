@@ -1,132 +1,189 @@
 package main
 
-// This is a simple JWKS server that serves one valid and one expired RSA key.
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 )
 
-// RSAKey represents an RSA key with its expiry and kid.
-type RSAKey struct {
-	PrivateKey *rsa.PrivateKey
-	PublicKey  *rsa.PublicKey
-	Expiry     time.Time
-	Kid        string
-}
+// -----------------------------
+// DB SETUP
+// -----------------------------
+var db *sql.DB
 
-// In-memory key store.
-var keyStore = map[string]RSAKey{}
-
-// Generate a new RSA key with a specified expiry offset (positive for future, negative for past).
-func generateKey(expiryOffset time.Duration) RSAKey {
-	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", "./totally_not_my_privateKeys.db")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	kid := uuid.New().String()
+	createTable := `
+	CREATE TABLE IF NOT EXISTS keys(
+		kid INTEGER PRIMARY KEY AUTOINCREMENT,
+		key BLOB NOT NULL,
+		exp INTEGER NOT NULL
+	);
+	`
 
-	return RSAKey{
-		PrivateKey: privKey,
-		PublicKey:  &privKey.PublicKey,
-		Expiry:     time.Now().Add(expiryOffset),
-		Kid:        kid,
+	_, err = db.Exec(createTable)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
-// Initialize 1 valid key and 1 expired key
+// -----------------------------
+// KEY GENERATION AND STORAGE
+// -----------------------------
+func generateKey(expiryOffset time.Duration) (*rsa.PrivateKey, int64) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	exp := time.Now().Add(expiryOffset).Unix()
+	return key, exp
+}
+
+func saveKey(key *rsa.PrivateKey, exp int64) {
+	keyBytes := x509.MarshalPKCS1PrivateKey(key)
+	_, err := db.Exec("INSERT INTO keys (key, exp) VALUES (?, ?)", keyBytes, exp)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// -----------------------------
+// SEED KEYS (one expired, one valid)
+// -----------------------------
 func initKeys() {
-	validKey := generateKey(1 * time.Hour)    // expires in future
-	expiredKey := generateKey(-1 * time.Hour) // already expired
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM keys").Scan(&count)
 
-	keyStore[validKey.Kid] = validKey
-	keyStore[expiredKey.Kid] = expiredKey
+	if count == 0 {
+		// valid key (1 hour in future)
+		key1, exp1 := generateKey(1 * time.Hour)
+		saveKey(key1, exp1)
+
+		// expired key (1 hour in past)
+		key2, exp2 := generateKey(-1 * time.Hour)
+		saveKey(key2, exp2)
+	}
 }
 
-// JWKS handler
+// -----------------------------
+// GET KEY FROM DB
+// -----------------------------
+func getKey(expired bool) (int, *rsa.PrivateKey) {
+	now := time.Now().Unix()
+	var row *sql.Row
+
+	if expired {
+		row = db.QueryRow("SELECT kid, key FROM keys WHERE exp <= ? LIMIT 1", now)
+	} else {
+		row = db.QueryRow("SELECT kid, key FROM keys WHERE exp > ? LIMIT 1", now)
+	}
+
+	var kid int
+	var keyBytes []byte
+	err := row.Scan(&kid, &keyBytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	privKey, err := x509.ParsePKCS1PrivateKey(keyBytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return kid, privKey
+}
+
+// -----------------------------
+// JWKS HELPER
+// -----------------------------
+func toBase64(n []byte) string {
+	return base64.RawURLEncoding.EncodeToString(n)
+}
+
+func publicKeyToJWK(privKey *rsa.PrivateKey, kid int) map[string]string {
+	pub := privKey.PublicKey
+	n := toBase64(pub.N.Bytes())
+	e := toBase64(big.NewInt(int64(pub.E)).Bytes())
+
+	return map[string]string{
+		"kty": "RSA",
+		"use": "sig",
+		"alg": "RS256",
+		"kid": fmt.Sprintf("%d", kid),
+		"n":   n,
+		"e":   e,
+	}
+}
+
+// -----------------------------
+// JWKS HANDLER
+// -----------------------------
 func jwksHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	rows, err := db.Query("SELECT kid, key FROM keys WHERE exp > ?", time.Now().Unix())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
 	keys := []map[string]string{}
 
-	for _, key := range keyStore {
-		if key.Expiry.After(time.Now()) { // only unexpired keys
-			n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
-			e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes())
+	for rows.Next() {
+		var kid int
+		var keyBytes []byte
+		rows.Scan(&kid, &keyBytes)
 
-			keys = append(keys, map[string]string{
-				"kty": "RSA",
-				"use": "sig",
-				"alg": "RS256",
-				"kid": key.Kid,
-				"n":   n,
-				"e":   e,
-			})
-		}
+		privKey, _ := x509.ParsePKCS1PrivateKey(keyBytes)
+		keys = append(keys, publicKeyToJWK(privKey, kid))
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"keys": keys,
 	})
 }
 
-// Auth handler
+// -----------------------------
+// AUTH HANDLER
+// -----------------------------
 func authHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	expired := r.URL.Query().Has("expired")
-	var chosenKey RSAKey
-	found := false
+	expired := r.URL.Query().Get("expired") != ""
+	kid, key := getKey(expired)
 
-	for _, key := range keyStore {
-		if expired && key.Expiry.Before(time.Now()) {
-			chosenKey = key
-			found = true
-			break
-		}
-		if !expired && key.Expiry.After(time.Now()) {
-			chosenKey = key
-			found = true
-			break
-		}
-	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"username": "userABC",
+		"exp":      time.Now().Add(time.Hour).Unix(),
+	})
+	token.Header["kid"] = fmt.Sprintf("%d", kid)
 
-	if !found {
-		http.Error(w, "No suitable key found", http.StatusInternalServerError)
-		return
-	}
-
-	expTime := time.Now().Add(1 * time.Hour)
-	if expired {
-		expTime = time.Now().Add(-1 * time.Hour)
-	}
-
-	token := jwt.New(jwt.SigningMethodRS256)
-	token.Header["kid"] = chosenKey.Kid
-	token.Claims = jwt.MapClaims{
-		"sub": "fakeuser",
-		"iat": time.Now().Unix(),
-		"exp": expTime.Unix(),
-	}
-
-	tokenString, err := token.SignedString(chosenKey.PrivateKey)
+	signed, err := token.SignedString(key)
 	if err != nil {
 		http.Error(w, "Failed to sign token", http.StatusInternalServerError)
 		return
@@ -134,11 +191,14 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(tokenString))
+	w.Write([]byte(signed))
 }
 
-// Main function to start the server
+// -----------------------------
+// MAIN
+// -----------------------------
 func main() {
+	initDB()
 	initKeys()
 
 	port := os.Getenv("PORT")
@@ -146,10 +206,9 @@ func main() {
 		port = "8080"
 	}
 
-	http.HandleFunc("/.well-known/jwks.json", jwksHandler)
 	http.HandleFunc("/auth", authHandler)
+	http.HandleFunc("/.well-known/jwks.json", jwksHandler)
 
 	fmt.Printf("JWKS server running on http://localhost:%s\n", port)
-	http.ListenAndServe(":"+port, nil)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
-
